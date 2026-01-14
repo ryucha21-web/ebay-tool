@@ -22,14 +22,14 @@ from deep_translator import GoogleTranslator
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# --- セッション状態の初期化 ---
+# --- セッション初期化 ---
 if 'scraped_data_list' not in st.session_state:
     st.session_state.scraped_data_list = []
 
-# --- 関数群 ---
-
+# --- 共通関数 ---
 def translate_text(text):
     try:
+        if not text or text == "取得失敗": return ""
         return GoogleTranslator(source='ja', target='en').translate(text)
     except:
         return text
@@ -38,7 +38,7 @@ def extract_hobby_brand(text):
     brands = [
         "Bandai", "Banpresto", "Nintendo", "Sony", "Sega", "Pokemon", 
         "Sanrio", "Konami", "Takara Tomy", "Good Smile Company", 
-        "Kotobukiya", "Tamiya", "Square Enix", "Capcom", "Funko", "Lego"
+        "Kotobukiya", "Tamiya", "Square Enix", "Capcom", "Funko", "Lego", "Mattel"
     ]
     text_lower = text.lower()
     for brand in brands:
@@ -59,73 +59,195 @@ def guess_type(text):
     else:
         return "Action Figure"
 
-# --- スクレイピング処理（URLパターンマッチング版） ---
+# --- サイト別スクレイピングロジック ---
+
+async def scrape_mercari_logic(page):
+    """メルカリ専用ロジック"""
+    # 画像取得 (static.mercdn.net)
+    images_elements = await page.locator("img").all()
+    image_urls = []
+    seen = set()
+    for img in images_elements:
+        src = await img.get_attribute("src")
+        if src and "static.mercdn.net/item/detail/orig/photos/" in src:
+            clean = src.split('?')[0]
+            if clean not in seen:
+                image_urls.append(clean)
+                seen.add(clean)
+    
+    title = await page.locator("h1").first.inner_text()
+    
+    price = "0"
+    if await page.locator("[data-testid='price']").count() > 0:
+        price = await page.locator("[data-testid='price']").first.inner_text()
+    
+    desc = ""
+    if await page.locator("[data-testid='description']").count() > 0:
+        desc = await page.locator("[data-testid='description']").first.inner_text()
+        
+    return {"title": title, "price": price, "description": desc, "images": image_urls}
+
+async def scrape_yahoo_logic(page):
+    """ヤフオク専用ロジック"""
+    # 画像取得 (auctions.c.yimg.jp)
+    # ヤフオクはメイン画像とサムネイルが別URLの場合があるが、大元の画像を探す
+    images_elements = await page.locator("img").all()
+    image_urls = []
+    seen = set()
+    for img in images_elements:
+        src = await img.get_attribute("src")
+        if src and "auctions.c.yimg.jp/images/" in src:
+            # サムネイルなどの小さな画像を排除するか、単にユニークにする
+            clean = src.split('?')[0]
+            if clean not in seen:
+                image_urls.append(clean)
+                seen.add(clean)
+
+    # タイトル (ProductTitle__text などクラス名は変わる可能性があるため h1 推奨)
+    title = ""
+    if await page.locator("h1").count() > 0:
+        title = await page.locator("h1").first.inner_text()
+        
+    # 価格 (Price__value)
+    price = "0"
+    # ヤフオクの価格クラスは複雑だが、"円"を含む大きな数字を探す手もある
+    # ここでは一般的なクラスを指定
+    price_selectors = ["[class*='Price__value']", ".Price__value", ".Price"]
+    for sel in price_selectors:
+        if await page.locator(sel).count() > 0:
+            price = await page.locator(sel).first.inner_text()
+            break
+
+    # 説明文
+    desc = ""
+    # ヤフオクの説明文はiframeに入っていることが多いが、最近はdivで表示されることも
+    desc_selectors = ["[class*='ProductExplanation__comment']", "#ProductExplanation"]
+    for sel in desc_selectors:
+        if await page.locator(sel).count() > 0:
+            desc = await page.locator(sel).first.inner_text()
+            break
+            
+    return {"title": title, "price": price, "description": desc, "images": image_urls}
+
+async def scrape_rakuten_logic(page):
+    """楽天専用ロジック"""
+    # 画像 (tshop.r10s.jp / image.rakuten.co.jp)
+    images_elements = await page.locator("img").all()
+    image_urls = []
+    seen = set()
+    for img in images_elements:
+        src = await img.get_attribute("src")
+        # 楽天の商品画像パターン
+        if src and ("tshop.r10s.jp" in src or "image.rakuten.co.jp" in src):
+            # アイコンやバナーを除外するための簡易フィルタ
+            if "cabinet" in src or "img" in src: 
+                clean = src.split('?')[0]
+                if clean not in seen:
+                    image_urls.append(clean)
+                    seen.add(clean)
+
+    # タイトル (item_name など)
+    title = ""
+    # 楽天は店舗によってHTMLが全然違うため、h1か特定のクラスを探す
+    if await page.locator(".item_name").count() > 0:
+        title = await page.locator(".item_name").first.inner_text()
+    elif await page.locator("h1").count() > 0:
+        title = await page.locator("h1").first.inner_text()
+
+    # 価格
+    price = "0"
+    if await page.locator("[data-price]").count() > 0: # data属性があればラッキー
+        price = await page.locator("[data-price]").first.get_attribute("data-price")
+    elif await page.locator(".price2").count() > 0:
+        price = await page.locator(".price2").first.inner_text()
+    elif await page.locator("span[itemprop='price']").count() > 0:
+        price = await page.locator("span[itemprop='price']").first.inner_text()
+
+    # 説明文 (item_desc など)
+    desc = ""
+    if await page.locator(".item_desc").count() > 0:
+        desc = await page.locator(".item_desc").first.inner_text()
+    elif await page.locator(".description").count() > 0:
+        desc = await page.locator(".description").first.inner_text()
+
+    return {"title": title, "price": price, "description": desc, "images": image_urls}
+
+async def scrape_amazon_logic(page):
+    """Amazon専用ロジック（難易度高・ベストエフォート）"""
+    # Amazonは画像取得が特殊。JSONの中にあったりするが、まずは表示画像を狙う
+    images_elements = await page.locator("img").all()
+    image_urls = []
+    seen = set()
+    for img in images_elements:
+        src = await img.get_attribute("src")
+        if src and ("m.media-amazon.com/images/I/" in src or "ssl-images-amazon.com" in src):
+            # Amazonの画像は ._AC_SX679_.jpg のようなリサイズ指定が入る
+            # これを削除して高画質版にするハックがあるが、まずはそのまま取る
+            if clean_src := src.split('._')[0] + '.jpg': # 簡易的な高画質化
+                 if clean_src not in seen:
+                    image_urls.append(clean_src)
+                    seen.add(clean_src)
+
+    title = ""
+    if await page.locator("#productTitle").count() > 0:
+        title = await page.locator("#productTitle").first.inner_text()
+
+    price = "0"
+    # Amazonの価格は .a-price > .a-offscreen に隠れている
+    if await page.locator(".a-price .a-offscreen").count() > 0:
+        price = await page.locator(".a-price .a-offscreen").first.inner_text()
+    
+    desc = ""
+    # 特徴リスト (bullets) を説明文とする
+    if await page.locator("#feature-bullets").count() > 0:
+        desc = await page.locator("#feature-bullets").first.inner_text()
+
+    return {"title": title, "price": price, "description": desc, "images": image_urls}
+
+
+# --- メインのスクレイピング分岐処理 ---
 async def scrape_data(url):
     async with async_playwright() as p:
-        # ヘッドレスモード設定
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        page = await browser.new_page()
+        
+        # Amazon対策: User-Agentを一般ブラウザに偽装
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
+        page = await context.new_page()
+        
         try:
-            # タイムアウト設定を長めに
             await page.goto(url, timeout=60000)
-            
-            # ページ読み込み完了を待つ（ネットワークの静寂を待つ）
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
             except:
-                pass # タイムアウトしても進む
-            
-            # 少し待機（画像の遅延読み込み対策）
-            await page.wait_for_timeout(3000)
+                pass
+            await page.wait_for_timeout(3000) # 読み込み待機
 
-            # --- 画像取得ロジック（最強版） ---
-            # ページ内のすべての「img」タグを取得
-            images_elements = await page.locator("img").all()
-            
-            image_urls = []
-            seen_urls = set() # 重複防止用
-
-            for img in images_elements:
-                src = await img.get_attribute("src")
-                if src:
-                    # メルカリの商品画像URLパターンが含まれているかチェック
-                    # "static.mercdn.net/item/detail/orig/photos/" が商品画像の証
-                    if "static.mercdn.net/item/detail/orig/photos/" in src:
-                        # クエリパラメータ(?以降)を削除してきれいなURLにする
-                        clean_url = src.split('?')[0]
-                        
-                        if clean_url not in seen_urls:
-                            image_urls.append(clean_url)
-                            seen_urls.add(clean_url)
-            
-            # 画像が見つからなかった場合のフォールバック
-            if not image_urls:
+            # URLによる分岐
+            if "mercari" in url:
+                data = await scrape_mercari_logic(page)
+                site_name = "Mercari"
+            elif "yahoo" in url: # auctions.yahoo...
+                data = await scrape_yahoo_logic(page)
+                site_name = "Yahoo Auction"
+            elif "rakuten" in url:
+                data = await scrape_rakuten_logic(page)
+                site_name = "Rakuten"
+            elif "amazon" in url:
+                data = await scrape_amazon_logic(page)
+                site_name = "Amazon"
+            else:
+                # 未知のサイトの場合は汎用的にh1とog:imageを取ってみる
+                title = await page.locator("h1").first.inner_text()
+                image_urls = []
                 meta_img = page.locator("meta[property='og:image']")
                 if await meta_img.count() > 0:
-                    src = await meta_img.get_attribute("content")
-                    image_urls.append(src)
+                     image_urls.append(await meta_img.get_attribute("content"))
+                data = {"title": title, "price": "0", "description": "", "images": image_urls}
+                site_name = "Unknown Site"
 
-            # 基本情報取得
-            title_el = page.locator("h1").first
-            title = await title_el.inner_text() if await title_el.count() > 0 else "取得失敗"
-            
-            price = "0"
-            # 価格セレクタも念のため複数パターン用意
-            if await page.locator("[data-testid='price']").count() > 0:
-                price = await page.locator("[data-testid='price']").first.inner_text()
-            elif await page.locator(".item-price-box").count() > 0:
-                price = await page.locator(".item-price-box").first.inner_text()
-            
-            desc = ""
-            if await page.locator("[data-testid='description']").count() > 0:
-                desc = await page.locator("[data-testid='description']").first.inner_text()
+            data["site"] = site_name
+            return data
 
-            return {
-                "title": title, 
-                "price": price, 
-                "description": desc, 
-                "images": image_urls
-            }
         except Exception as e:
             return {"error": str(e)}
         finally:
@@ -133,7 +255,7 @@ async def scrape_data(url):
 
 # --- 画面UI ---
 st.set_page_config(layout="wide")
-st.title("eBay出品ツール (全画像取得・最強版)")
+st.title("eBay出品ツール (4大プラットフォーム対応版)")
 
 # サイドバー
 st.sidebar.header("設定")
@@ -141,13 +263,13 @@ usd_rate = st.sidebar.number_input("為替レート (1ドル=〇〇円)", value=
 target_profit = st.sidebar.number_input("目標利益 (円)", value=2000)
 ebay_fee_rate = 0.15 
 
-url = st.text_input("メルカリの商品URL", "")
+url = st.text_input("商品URL (Mercari, Yahoo, Rakuten, Amazon)", "")
 
 if st.button("情報を取得して変換"):
     if not url:
         st.warning("URLを入力してください")
     else:
-        with st.spinner('全画像を解析中...'):
+        with st.spinner('サイトを判別して解析中...'):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             data = loop.run_until_complete(scrape_data(url))
@@ -156,20 +278,25 @@ if st.button("情報を取得して変換"):
             if "error" in data:
                 st.error(f"エラー: {data['error']}")
             else:
+                st.info(f"検出されたサイト: {data['site']}")
+                
+                # 翻訳・推測
                 title_en = translate_text(data['title'])
                 desc_en = translate_text(data['description'][:500])
                 brand_val = extract_hobby_brand(title_en + " " + data['title'])
                 type_val = guess_type(title_en + " " + data['title'])
                 
                 try:
-                    price_jp = int(re.sub(r'[^\d]', '', data['price']))
+                    # 価格の正規化（カンマや円記号を除去）
+                    price_str = str(data['price']).replace(',', '').replace('円', '').replace('￥', '')
+                    price_jp = int(re.search(r'\d+', price_str).group())
                     price_usd = (price_jp + target_profit) / usd_rate / (1 - ebay_fee_rate)
                     price_usd = round(price_usd, 2)
                 except:
                     price_jp = 0
                     price_usd = 0.00
 
-                pic_url_str = "|".join(data['images'])
+                pic_url_str = "|".join(data['images']) if data['images'] else ""
 
                 st.session_state.current_data = {
                     "Action": "Add",
@@ -188,15 +315,12 @@ if st.button("情報を取得して変換"):
                 col1, col2 = st.columns([1, 1])
                 
                 with col1:
-                    st.subheader(f"📸 取得画像 ({len(data['images'])}枚)")
-                    # 取得順に番号を振って表示
+                    st.subheader(f"📸 画像 ({len(data['images'])}枚)")
                     if data['images']:
                         cols = st.columns(4)
-                        for i, img_url in enumerate(data['images'][:8]): # 最大8枚プレビュー
+                        for i, img_url in enumerate(data['images'][:8]):
                             with cols[i % 4]:
                                 st.image(img_url, caption=f"No.{i+1}", use_container_width=True)
-                        if len(data['images']) > 8:
-                            st.caption(f"...他 {len(data['images'])-8} 枚")
                     
                     st.write(f"🇯🇵 仕入: ¥{price_jp}")
                     st.caption(data['title'])
@@ -206,7 +330,7 @@ if st.button("情報を取得して変換"):
                     st.success(f"出品価格: ${price_usd}")
                     st.info("Item Specificsを入力してリストに追加してください")
 
-# フォームエリア
+# フォームエリア (前回と同じなので省略なしで記載)
 if 'current_data' in st.session_state:
     st.markdown("---")
     with st.form("edit_form"):
@@ -218,8 +342,8 @@ if 'current_data' in st.session_state:
         
         st.caption("Required Item Specifics")
         r1, r2 = st.columns(2)
-        new_franchise = r1.text_input("Franchise (作品名)", c_data['Franchise'])
-        new_character = r2.text_input("Character (キャラ名)", c_data['Character'])
+        new_franchise = r1.text_input("Franchise", c_data['Franchise'])
+        new_character = r2.text_input("Character", c_data['Character'])
         
         r3, r4 = st.columns(2)
         new_brand = r3.text_input("Brand", c_data['Brand'])
@@ -236,24 +360,15 @@ if 'current_data' in st.session_state:
             c_data['Type'] = new_type
             
             st.session_state.scraped_data_list.append(c_data)
-            st.success(f"✅ 追加しました！（画像数: {len(c_data['PicURL'].split('|'))}枚）")
+            st.success(f"✅ 追加しました！")
 
-# リスト表示エリア
 st.markdown("---")
 st.subheader(f"📂 出品待ちリスト ({len(st.session_state.scraped_data_list)}件)")
 
 if st.session_state.scraped_data_list:
     df = pd.DataFrame(st.session_state.scraped_data_list)
-    
     display_df = df.copy()
     display_df['PicURL'] = display_df['PicURL'].apply(lambda x: x[:30] + "..." if len(x) > 30 else x)
-    
     st.dataframe(display_df)
-    
     csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 CSVをダウンロード (eBay用)",
-        data=csv,
-        file_name='ebay_collectibles_full_images.csv',
-        mime='text/csv',
-    )
+    st.download_button(label="📥 CSVダウンロード", data=csv, file_name='ebay_multi_site.csv', mime='text/csv')
