@@ -61,18 +61,10 @@ def guess_type(text):
 
 # --- サイト別スクレイピングロジック ---
 
-async def get_meta_content(page, property_name):
-    """メタタグ(og:titleなど)の中身を取得する便利関数"""
-    element = page.locator(f"meta[property='{property_name}']")
-    if await element.count() > 0:
-        return await element.first.get_attribute("content")
-    return None
-
 async def scrape_mercari_logic(page):
-    """メルカリ"""
-    image_urls = []
-    # 画像: URLパターンマッチング
+    """メルカリ専用ロジック"""
     images_elements = await page.locator("img").all()
+    image_urls = []
     seen = set()
     for img in images_elements:
         src = await img.get_attribute("src")
@@ -82,11 +74,6 @@ async def scrape_mercari_logic(page):
                 image_urls.append(clean)
                 seen.add(clean)
     
-    # フォールバック
-    if not image_urls:
-        og_img = await get_meta_content(page, "og:image")
-        if og_img: image_urls.append(og_img)
-
     title = await page.locator("h1").first.inner_text()
     
     price = "0"
@@ -100,120 +87,76 @@ async def scrape_mercari_logic(page):
     return {"title": title, "price": price, "description": desc, "images": image_urls}
 
 async def scrape_yahoo_logic(page):
-    """ヤフオク（改善版：メタタグ優先）"""
+    """ヤフオク専用ロジック"""
+    images_elements = await page.locator("img").all()
     image_urls = []
-    
-    # 1. メイン画像をメタタグから確実に取る
-    og_img = await get_meta_content(page, "og:image")
-    if og_img:
-        image_urls.append(og_img)
+    seen = set()
+    for img in images_elements:
+        src = await img.get_attribute("src")
+        if src and "auctions.c.yimg.jp/images/" in src:
+            clean = src.split('?')[0]
+            if clean not in seen:
+                image_urls.append(clean)
+                seen.add(clean)
 
-    # 2. ページ内の画像コンテナから追加画像を探す
-    # ヤフオクの商品画像エリア
-    img_container_selectors = [".ProductImage__inner", ".L-image", "#itm_img"]
-    
-    for container in img_container_selectors:
-        if await page.locator(container).count() > 0:
-            imgs = await page.locator(f"{container} img").all()
-            for img in imgs:
-                src = await img.get_attribute("src")
-                if src:
-                    # サムネイル除去などは一旦せず、auctions.c.yimg.jp を含むものを取得
-                    if "auctions.c.yimg.jp" in src:
-                        clean = src.split('?')[0] # クエリ削除
-                        if clean not in image_urls: # 重複チェック
-                            image_urls.append(clean)
-
-    # タイトル
-    title = await get_meta_content(page, "og:title")
-    if not title:
-        if await page.locator("h1").count() > 0:
-            title = await page.locator("h1").first.inner_text()
-
-    # 価格
+    title = ""
+    if await page.locator("h1").count() > 0:
+        title = await page.locator("h1").first.inner_text()
+        
     price = "0"
-    price_selectors = ["[class*='Price__value']", ".Price__value", ".Price", "dd.price"]
+    price_selectors = ["[class*='Price__value']", ".Price__value", ".Price"]
     for sel in price_selectors:
         if await page.locator(sel).count() > 0:
             price = await page.locator(sel).first.inner_text()
             break
 
-    # 説明文
-    desc = await get_meta_content(page, "og:description")
-    if not desc:
-        desc_selectors = ["[class*='ProductExplanation__comment']", "#ProductExplanation"]
-        for sel in desc_selectors:
-            if await page.locator(sel).count() > 0:
-                desc = await page.locator(sel).first.inner_text()
-                break
+    desc = ""
+    desc_selectors = ["[class*='ProductExplanation__comment']", "#ProductExplanation"]
+    for sel in desc_selectors:
+        if await page.locator(sel).count() > 0:
+            desc = await page.locator(sel).first.inner_text()
+            break
             
     return {"title": title, "price": price, "description": desc, "images": image_urls}
 
 async def scrape_rakuten_logic(page):
-    """楽天（改善版：メタタグ優先・ロゴ除外）"""
-    image_urls = []
-    
-    # 1. メイン画像 (og:image)
-    og_img = await get_meta_content(page, "og:image")
-    if og_img:
-        image_urls.append(og_img)
-
-    # 2. ページ内画像探索（ゴミ画像の除外強化）
+    """楽天専用ロジック"""
     images_elements = await page.locator("img").all()
+    image_urls = []
     seen = set()
-    if og_img: seen.add(og_img)
-
     for img in images_elements:
         src = await img.get_attribute("src")
-        if src:
-            # 楽天の商品画像URLパターンのみを許可
-            # tshop.r10s.jp (商品画像) または cabinet (商品倉庫) を含むもの
-            if "tshop.r10s.jp" in src or "cabinet" in src:
-                # 明らかにロゴやバナーっぽいファイル名を除外
-                lower_src = src.lower()
-                if "logo" in lower_src or "banner" in lower_src or "parts" in lower_src or "icon" in lower_src:
-                    continue
-                
+        if src and ("tshop.r10s.jp" in src or "image.rakuten.co.jp" in src):
+            if "cabinet" in src or "img" in src: 
                 clean = src.split('?')[0]
                 if clean not in seen:
                     image_urls.append(clean)
                     seen.add(clean)
 
-    # タイトル (og:title優先)
-    title = await get_meta_content(page, "og:title")
-    if not title:
-        # 楽天共通のヘッダータイトルなどを探す
-        if await page.locator(".item_name").count() > 0:
-            title = await page.locator(".item_name").first.inner_text()
-        elif await page.locator("h1").count() > 0:
-            title = await page.locator("h1").first.inner_text()
+    title = ""
+    if await page.locator(".item_name").count() > 0:
+        title = await page.locator(".item_name").first.inner_text()
+    elif await page.locator("h1").count() > 0:
+        title = await page.locator("h1").first.inner_text()
 
-    # 価格
     price = "0"
-    # メタタグに価格がある場合もある
-    og_price = await page.locator("meta[property='product:price:amount']").get_attribute("content")
-    if og_price:
-        price = og_price
-    else:
-        if await page.locator("[data-price]").count() > 0:
-            price = await page.locator("[data-price]").first.get_attribute("data-price")
-        elif await page.locator(".price2").count() > 0:
-            price = await page.locator(".price2").first.inner_text()
-        elif await page.locator("span[itemprop='price']").count() > 0:
-            price = await page.locator("span[itemprop='price']").first.inner_text()
+    if await page.locator("[data-price]").count() > 0:
+        price = await page.locator("[data-price]").first.get_attribute("data-price")
+    elif await page.locator(".price2").count() > 0:
+        price = await page.locator(".price2").first.inner_text()
+    elif await page.locator("span[itemprop='price']").count() > 0:
+        price = await page.locator("span[itemprop='price']").first.inner_text()
 
-    # 説明文
-    desc = await get_meta_content(page, "og:description")
-    if not desc:
-        if await page.locator(".item_desc").count() > 0:
-            desc = await page.locator(".item_desc").first.inner_text()
-        elif await page.locator(".description").count() > 0:
-            desc = await page.locator(".description").first.inner_text()
+    desc = ""
+    if await page.locator(".item_desc").count() > 0:
+        desc = await page.locator(".item_desc").first.inner_text()
+    elif await page.locator(".description").count() > 0:
+        desc = await page.locator(".description").first.inner_text()
 
     return {"title": title, "price": price, "description": desc, "images": image_urls}
 
 async def scrape_amazon_logic(page):
-    """Amazon（現状維持）"""
+    """Amazon専用ロジック"""
     images_elements = await page.locator("img").all()
     image_urls = []
     seen = set()
@@ -240,10 +183,11 @@ async def scrape_amazon_logic(page):
     return {"title": title, "price": price, "description": desc, "images": image_urls}
 
 
-# --- メイン処理 ---
+# --- メインのスクレイピング分岐処理 ---
 async def scrape_data(url):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
         page = await context.new_page()
         
@@ -268,11 +212,11 @@ async def scrape_data(url):
                 data = await scrape_amazon_logic(page)
                 site_name = "Amazon"
             else:
-                title = await get_meta_content(page, "og:title")
-                if not title: title = await page.locator("h1").first.inner_text()
+                title = await page.locator("h1").first.inner_text()
                 image_urls = []
-                og_img = await get_meta_content(page, "og:image")
-                if og_img: image_urls.append(og_img)
+                meta_img = page.locator("meta[property='og:image']")
+                if await meta_img.count() > 0:
+                     image_urls.append(await meta_img.get_attribute("content"))
                 data = {"title": title, "price": "0", "description": "", "images": image_urls}
                 site_name = "Unknown Site"
 
@@ -284,9 +228,9 @@ async def scrape_data(url):
         finally:
             await browser.close()
 
-# --- 画面UI（変更なし） ---
+# --- 画面UI ---
 st.set_page_config(layout="wide")
-st.title("eBay出品ツール (全サイト改善版)")
+st.title("eBay出品ツール (4大プラットフォーム対応版)")
 
 st.sidebar.header("設定")
 usd_rate = st.sidebar.number_input("為替レート (1ドル=〇〇円)", value=150)
@@ -364,7 +308,7 @@ if 'current_data' in st.session_state:
         c_data = st.session_state.current_data
         
         col_a, col_b = st.columns([3, 1])
-        new_title = col_a.text_input("Title", c_data['Title'] or "", max_chars=80)
+        new_title = col_a.text_input("Title", c_data['Title'], max_chars=80)
         new_price = col_b.number_input("Price ($)", value=c_data['StartPrice'])
         
         st.caption("Required Item Specifics")
@@ -398,4 +342,4 @@ if st.session_state.scraped_data_list:
     display_df['PicURL'] = display_df['PicURL'].apply(lambda x: x[:30] + "..." if len(x) > 30 else x)
     st.dataframe(display_df)
     csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(label="📥 CSVダウンロード", data=csv, file_name='ebay_multi_site_v2.csv', mime='text/csv')
+    st.download_button(label="📥 CSVダウンロード", data=csv, file_name='ebay_multi_site.csv', mime='text/csv')
