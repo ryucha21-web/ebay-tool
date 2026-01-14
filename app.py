@@ -1,39 +1,33 @@
 import streamlit as st
 import asyncio
 import sys
-import os
 import subprocess
 
-# --- サーバー起動時にブラウザを強制インストールする魔法のコード ---
+# --- 【重要】クラウド環境用のブラウザインストール処理 ---
 def install_playwright_browser():
-    # ブラウザがインストールされているか確認するための簡易チェック
-    # (毎回走ると遅いので、ロックファイル等で制御するのがベストですが、今回は簡易的にtry-exceptで実装)
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        # ライブラリがない場合はインストール
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
-    
-    # ブラウザ本体(Chromium)のインストール
-    # 毎回実行すると重いので、エラーが出た時だけ実行するロジックにする手もありますが、
-    # Streamlit Cloudの仕様上、起動時に一度実行するのが確実です。
-    print("Installing Playwright browsers...")
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+        # ブラウザフォルダがあるか確認（簡易チェック）
+        import os
+        # Playwrightのブラウザがインストールされているか確認
+        # 毎回走ると遅いので本来はチェックが必要ですが、クラウドでは起動時に実行するのが確実
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("Browser installed successfully.")
+    except Exception as e:
+        print(f"Error installing browser: {e}")
 
-# アプリ起動時に一度だけ実行
+# アプリ起動時に実行
 install_playwright_browser()
-# -------------------------------------------------------------
+# -------------------------------------------------------
 
 from playwright.async_api import async_playwright
 from deep_translator import GoogleTranslator
-import time
 import re
 
-# --- Windows/Linux互換性のための設定 ---
+# --- Windows対策（ローカルで動かす場合用） ---
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# --- ここから下の関数は前回と同じ ---
+# --- 関数定義 ---
 
 def translate_text(text):
     try:
@@ -58,8 +52,9 @@ def extract_brand(text):
 
 async def scrape_data(url):
     async with async_playwright() as p:
-        # ヘッドレスモードで起動
-        browser = await p.chromium.launch(headless=True)
+        # ヘッドレスモード（画面なし）で起動
+        # args=['--no-sandbox'] はクラウド環境での安定性を高めます
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         page = await browser.new_page()
         
         try:
@@ -69,7 +64,6 @@ async def scrape_data(url):
             except:
                 pass
             
-            # 少し待機
             await page.wait_for_timeout(2000)
 
             title_el = page.locator("h1").first
@@ -112,7 +106,7 @@ if st.button("情報を取得して変換"):
     if not url:
         st.warning("URLを入力してください")
     else:
-        with st.spinner('サーバーで処理中...（初回は時間がかかります）'):
+        with st.spinner('サーバーで処理中...（初回はインストール等のため時間がかかります）'):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             data = loop.run_until_complete(scrape_data(url))
