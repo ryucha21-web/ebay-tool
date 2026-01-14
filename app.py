@@ -9,7 +9,6 @@ import re
 def install_playwright_browser():
     try:
         import os
-        # 簡易チェックしてインストール
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     except Exception as e:
         print(f"Error installing browser: {e}")
@@ -27,31 +26,27 @@ if sys.platform == 'win32':
 if 'scraped_data_list' not in st.session_state:
     st.session_state.scraped_data_list = []
 
-# --- 便利な関数たち ---
+# --- 関数群 ---
 
 def translate_text(text):
-    """日本語→英語翻訳"""
     try:
         return GoogleTranslator(source='ja', target='en').translate(text)
     except:
         return text
 
 def extract_hobby_brand(text):
-    """ホビー・ゲーム系の主要ブランド抽出"""
-    # 日本の主要メーカーリスト
     brands = [
         "Bandai", "Banpresto", "Nintendo", "Sony", "Sega", "Pokemon", 
         "Sanrio", "Konami", "Takara Tomy", "Good Smile Company", 
-        "Kotobukiya", "Tamiya", "Square Enix", "Capcom", "Funko"
+        "Kotobukiya", "Tamiya", "Square Enix", "Capcom", "Funko", "Lego"
     ]
     text_lower = text.lower()
     for brand in brands:
         if brand.lower() in text_lower:
             return brand
-    return "Unbranded" # または空欄
+    return "Unbranded"
 
 def guess_type(text):
-    """タイトルから商品タイプを簡易推測"""
     text_lower = text.lower()
     if "figure" in text_lower or "フィギュア" in text_lower:
         return "Action Figure"
@@ -62,12 +57,11 @@ def guess_type(text):
     elif "game" in text_lower or "console" in text_lower:
         return "Video Game"
     else:
-        return "Action Figure" # デフォルト
+        return "Action Figure"
 
-# --- スクレイピング処理 ---
+# --- スクレイピング処理（全画像取得版） ---
 async def scrape_data(url):
     async with async_playwright() as p:
-        # ヘッドレスモード設定
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         page = await browser.new_page()
         try:
@@ -78,6 +72,7 @@ async def scrape_data(url):
                 pass
             await page.wait_for_timeout(2000)
 
+            # 基本情報
             title_el = page.locator("h1").first
             title = await title_el.inner_text() if await title_el.count() > 0 else "取得失敗"
             
@@ -91,12 +86,35 @@ async def scrape_data(url):
             if await desc_el.count() > 0:
                 desc = await desc_el.inner_text()
             
-            image_url = ""
-            meta_img = page.locator("meta[property='og:image']")
-            if await meta_img.count() > 0:
-                image_url = await meta_img.get_attribute("content")
+            # 【変更点】全画像を取得するロジック
+            image_urls = []
+            
+            # メルカリは data-testid="image-0", image-1... という属性がついている
+            # まずは image-0 から image-19 くらいまでループして探す
+            for i in range(20): 
+                img_locator = page.locator(f"[data-testid='image-{i}']")
+                if await img_locator.count() > 0:
+                    src = await img_locator.get_attribute("src")
+                    if src:
+                        image_urls.append(src)
+                else:
+                    # 連番が途切れたら終了（ただし念のため最初の数枚が見つからない場合も考慮してbreakは慎重に）
+                    if i > 0 and len(image_urls) > 0:
+                        break
+            
+            # もし上記で見つからなければ、og:imageをフォールバックとして使う
+            if not image_urls:
+                meta_img = page.locator("meta[property='og:image']")
+                if await meta_img.count() > 0:
+                    src = await meta_img.get_attribute("content")
+                    image_urls.append(src)
 
-            return {"title": title, "price": price, "description": desc, "image_url": image_url}
+            return {
+                "title": title, 
+                "price": price, 
+                "description": desc, 
+                "images": image_urls # リストで返す
+            }
         except Exception as e:
             return {"error": str(e)}
         finally:
@@ -104,21 +122,21 @@ async def scrape_data(url):
 
 # --- 画面UI ---
 st.set_page_config(layout="wide")
-st.title("eBay出品ツール (コレクティブルズ/ホビー版)")
+st.title("eBay出品ツール (全画像取得 & ホビー対応版)")
 
-# サイドバー設定
+# サイドバー
 st.sidebar.header("設定")
 usd_rate = st.sidebar.number_input("為替レート (1ドル=〇〇円)", value=150)
 target_profit = st.sidebar.number_input("目標利益 (円)", value=2000)
 ebay_fee_rate = 0.15 
 
-url = st.text_input("メルカリの商品URL (フィギュア・ゲーム・トレカ等)", "")
+url = st.text_input("メルカリの商品URL", "")
 
 if st.button("情報を取得して変換"):
     if not url:
         st.warning("URLを入力してください")
     else:
-        with st.spinner('ホビー情報を解析中...'):
+        with st.spinner('全画像を解析中...'):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             data = loop.run_until_complete(scrape_data(url))
@@ -127,11 +145,9 @@ if st.button("情報を取得して変換"):
             if "error" in data:
                 st.error(f"エラー: {data['error']}")
             else:
-                # 翻訳
+                # 翻訳・推測
                 title_en = translate_text(data['title'])
                 desc_en = translate_text(data['description'][:500])
-                
-                # ホビー特化の推測ロジック
                 brand_val = extract_hobby_brand(title_en + " " + data['title'])
                 type_val = guess_type(title_en + " " + data['title'])
                 
@@ -144,58 +160,66 @@ if st.button("情報を取得して変換"):
                     price_jp = 0
                     price_usd = 0.00
 
-                # 一時保存データ作成
+                # 画像リストをeBay用文字列（パイプ区切り）に変換
+                # 例: url1|url2|url3
+                pic_url_str = "|".join(data['images'])
+
                 st.session_state.current_data = {
                     "Action": "Add",
-                    "Category": "246", # Action FiguresのID (仮)
+                    "Category": "246", 
                     "Title": title_en,
                     "StartPrice": price_usd,
-                    "ConditionID": "3000", # Used
+                    "ConditionID": "3000",
                     "Description": desc_en,
-                    "PicURL": data['image_url'],
-                    
-                    # --- Collectibles 必須4項目 ---
+                    "PicURL": pic_url_str, # ここに結合したURLが入る
                     "Brand": brand_val,
                     "Type": type_val,
-                    "Franchise": "", # 作品名（手入力推奨）
-                    "Character": "", # キャラ名（手入力推奨）
+                    "Franchise": "",
+                    "Character": "",
                 }
                 
-                # 画面表示
-                col1, col2 = st.columns(2)
+                # --- 表示エリア ---
+                col1, col2 = st.columns([1, 1])
+                
                 with col1:
-                    if data['image_url']: st.image(data['image_url'], width=200)
+                    st.subheader(f"📸 取得画像 ({len(data['images'])}枚)")
+                    # 取得した画像をタイル状に表示
+                    if data['images']:
+                        # 最初の4枚だけプレビュー表示（多すぎると画面埋まるため）
+                        cols = st.columns(4)
+                        for i, img_url in enumerate(data['images'][:4]):
+                            with cols[i]:
+                                st.image(img_url, use_container_width=True)
+                        if len(data['images']) > 4:
+                            st.caption(f"...他 {len(data['images'])-4} 枚")
+                    
                     st.write(f"🇯🇵 仕入: ¥{price_jp}")
                     st.caption(data['title'])
                 
                 with col2:
-                    st.success(f"🇺🇸 出品: ${price_usd}")
-                    st.info("作品名(Franchise)とキャラ名(Character)を入力してください")
+                    st.subheader("🇺🇸 出品データ確認")
+                    st.success(f"出品価格: ${price_usd}")
+                    st.info("Item Specificsを入力してリストに追加してください")
 
 # フォームエリア
 if 'current_data' in st.session_state:
-    st.markdown("### 🤖 Item Specifics (ホビー・グッズ用)")
+    st.markdown("---")
     with st.form("edit_form"):
         c_data = st.session_state.current_data
         
-        # タイトルと価格
         col_a, col_b = st.columns([3, 1])
-        new_title = col_a.text_input("Title (80文字以内)", c_data['Title'], max_chars=80)
+        new_title = col_a.text_input("Title", c_data['Title'], max_chars=80)
         new_price = col_b.number_input("Price ($)", value=c_data['StartPrice'])
         
-        st.markdown("---")
-        st.caption("Required Item Specifics (必須項目)")
-        
-        # コレクティブルズ用入力欄
+        st.caption("Required Item Specifics")
         r1, r2 = st.columns(2)
-        new_franchise = r1.text_input("Franchise (作品・シリーズ名)", c_data['Franchise'], placeholder="例: Dragon Ball Z, Pokemon, One Piece")
-        new_character = r2.text_input("Character (キャラクター名)", c_data['Character'], placeholder="例: Son Goku, Pikachu, Luffy")
+        new_franchise = r1.text_input("Franchise (作品名)", c_data['Franchise'])
+        new_character = r2.text_input("Character (キャラ名)", c_data['Character'])
         
         r3, r4 = st.columns(2)
-        new_brand = r3.text_input("Brand (メーカー)", c_data['Brand'])
-        new_type = r4.text_input("Type (種類)", c_data['Type'])
+        new_brand = r3.text_input("Brand", c_data['Brand'])
+        new_type = r4.text_input("Type", c_data['Type'])
 
-        # データ更新と保存
         submitted = st.form_submit_button("リストに追加する")
         
         if submitted:
@@ -207,7 +231,7 @@ if 'current_data' in st.session_state:
             c_data['Type'] = new_type
             
             st.session_state.scraped_data_list.append(c_data)
-            st.success("✅ リストに追加しました！")
+            st.success(f"✅ 追加しました！（画像数: {len(c_data['PicURL'].split('|'))}枚）")
 
 # リスト表示エリア
 st.markdown("---")
@@ -216,18 +240,16 @@ st.subheader(f"📂 出品待ちリスト ({len(st.session_state.scraped_data_li
 if st.session_state.scraped_data_list:
     df = pd.DataFrame(st.session_state.scraped_data_list)
     
-    # 重要な列を左に
-    cols = ["Title", "StartPrice", "Franchise", "Character", "Brand", "Type", "PicURL"]
-    existing_cols = [c for c in cols if c in df.columns]
-    remaining_cols = [c for c in df.columns if c not in existing_cols]
-    df = df[existing_cols + remaining_cols]
-
-    st.dataframe(df)
+    # 表示用にPicURLは長すぎるのでカットして表示してもいいが、CSVには全部入る
+    display_df = df.copy()
+    display_df['PicURL'] = display_df['PicURL'].apply(lambda x: x[:30] + "..." if len(x) > 30 else x)
+    
+    st.dataframe(display_df)
     
     csv = df.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label="📥 CSVをダウンロード",
+        label="📥 CSVをダウンロード (eBay用)",
         data=csv,
-        file_name='ebay_collectibles.csv',
+        file_name='ebay_collectibles_full_images.csv',
         mime='text/csv',
     )
