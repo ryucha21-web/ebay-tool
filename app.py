@@ -1,16 +1,39 @@
 import streamlit as st
-from playwright.async_api import async_playwright # 【変更】async_apiを使う
+import asyncio
+import sys
+import os
+import subprocess
+
+# --- サーバー起動時にブラウザを強制インストールする魔法のコード ---
+def install_playwright_browser():
+    # ブラウザがインストールされているか確認するための簡易チェック
+    # (毎回走ると遅いので、ロックファイル等で制御するのがベストですが、今回は簡易的にtry-exceptで実装)
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        # ライブラリがない場合はインストール
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+    
+    # ブラウザ本体(Chromium)のインストール
+    # 毎回実行すると重いので、エラーが出た時だけ実行するロジックにする手もありますが、
+    # Streamlit Cloudの仕様上、起動時に一度実行するのが確実です。
+    print("Installing Playwright browsers...")
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
+
+# アプリ起動時に一度だけ実行
+install_playwright_browser()
+# -------------------------------------------------------------
+
+from playwright.async_api import async_playwright
 from deep_translator import GoogleTranslator
 import time
 import re
-import asyncio # 【追加】非同期処理用
-import sys
 
-# --- Windows対策: イベントループの設定 ---
+# --- Windows/Linux互換性のための設定 ---
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# --- 関数定義 ---
+# --- ここから下の関数は前回と同じ ---
 
 def translate_text(text):
     try:
@@ -33,30 +56,22 @@ def extract_brand(text):
             return brand
     return ""
 
-# 【変更】非同期関数(async)に変更
 async def scrape_data(url):
-    """メルカリから情報を抜く関数（非同期版）"""
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True) # awaitをつける
+        # ヘッドレスモードで起動
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-        # await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0"}) 
-        # ※メルカリ等でヘッダー設定がエラーの原因になることがあるため一旦シンプルに
-
+        
         try:
-            # タイムアウト等の設定
             await page.goto(url, timeout=60000)
-            
-            # タイトルが出るまで待つ
             try:
                 await page.wait_for_selector("h1", state="visible", timeout=30000)
             except:
-                pass # タイムアウトしても一旦進む
-
-            await page.wait_for_timeout(2000) # time.sleepの代わり
-
-            # データ取得（awaitが必要な箇所と不要な箇所がある）
-            # inner_text()などはawaitが必要
+                pass
             
+            # 少し待機
+            await page.wait_for_timeout(2000)
+
             title_el = page.locator("h1").first
             title = await title_el.inner_text() if await title_el.count() > 0 else "取得失敗"
             
@@ -86,10 +101,10 @@ async def scrape_data(url):
         finally:
             await browser.close()
 
-# --- 画面描画（UI） ---
+# --- 画面描画 ---
 
 st.set_page_config(layout="wide")
-st.title("eBay出品データ生成ツール (Alpha Ver.)")
+st.title("eBay出品データ生成ツール (Cloud Ver.)")
 
 url = st.text_input("メルカリの商品URLを貼り付けてください", "")
 
@@ -97,9 +112,7 @@ if st.button("情報を取得して変換"):
     if not url:
         st.warning("URLを入力してください")
     else:
-        with st.spinner('スクレイピング＆翻訳中...'):
-            
-            # 【変更】非同期関数を無理やり実行するための魔法の記述
+        with st.spinner('サーバーで処理中...（初回は時間がかかります）'):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             data = loop.run_until_complete(scrape_data(url))
@@ -108,7 +121,6 @@ if st.button("情報を取得して変換"):
             if "error" in data:
                 st.error(f"エラーが発生しました: {data['error']}")
             else:
-                # 2. データ変換（ここは今まで通り）
                 title_en = translate_text(data['title'])
                 desc_en = translate_text(data['description'][:500])
                 brand_guess = extract_brand(title_en + " " + data['title'])
